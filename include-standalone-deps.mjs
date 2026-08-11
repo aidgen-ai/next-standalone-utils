@@ -29,6 +29,17 @@
  *     to --root, matches are copied verbatim (a trailing "double-star" is
  *     implied for directory matches)
  *
+ * Any argument may carry a `:trace` or `:notrace` suffix to override that
+ * auto-detected handling (the suffix applies to the whole argument, including
+ * the subpath of a `pkg:` specifier):
+ *   - `:trace`    the argument is an entrypoint: files are traced with
+ *                 @vercel/nft, directories and glob matches contribute every
+ *                 file they contain (recursively) as an entrypoint
+ *   - `:notrace`  the argument is copied verbatim: files are copied as-is
+ *                 (no cmd-shim resolution, no tracing), directories and glob
+ *                 matches are copied recursively
+ * Defaults are unchanged: files trace, directories and globs do not.
+ *
  * All copies — traced files, explicit directories, and glob matches alike —
  * still go through the same node_modules filter, so anything outside
  * node_modules is skipped unless --all is passed.
@@ -77,7 +88,7 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--ignore-missing') ignoreMissing = true;
   else if (a === '--help' || a === '-h') {
     console.log(
-      'Usage: include-standalone-deps [--out dir] [--root dir] [--all] [--ignore-missing] [--verbose] <path-or-glob>...',
+      'Usage: include-standalone-deps [--out dir] [--root dir] [--all] [--ignore-missing] [--verbose] <path-or-glob>[:trace|:notrace]...',
     );
     process.exit(0);
   } else if (a.startsWith('--')) {
@@ -117,7 +128,19 @@ function parseCmdShim(shimPath, content) {
 const entrypoints = new Set(); // absolute JS files to hand to nft
 const extraFiles = new Set(); // absolute files to copy verbatim (shims, symlinks)
 const dirs = new Set(); // absolute directories to copy recursively
-const globs = []; // patterns relative to root
+const globs = []; // { pattern (relative to root), mode }
+
+// Explicit handling requested per argument; `null` means "auto-detect"
+// (files trace, directories and globs are copied verbatim).
+const TRACE = 'trace';
+const NOTRACE = 'notrace';
+
+/** Split a trailing `:trace` / `:notrace` suffix off an argument. */
+function parseModeSuffix(input) {
+  const m = /:(trace|notrace)$/.exec(input);
+  if (!m) return { spec: input, mode: null };
+  return { spec: input.slice(0, m.index), mode: m[1] };
+}
 
 // Glob metacharacters that mark an argument as a pattern rather than a
 // literal path. Note: @ and + (common in pnpm store paths) are not magic.
@@ -131,6 +154,26 @@ function missing(message) {
   } else {
     console.error(`error: ${message} (use --ignore-missing to continue anyway)`);
     process.exit(1);
+  }
+}
+
+/**
+ * Handle a regular file: with `:notrace` it is copied verbatim, otherwise it is
+ * resolved through .bin shims and handed to nft.
+ */
+async function addFile(abs, label, mode) {
+  if (mode === NOTRACE) {
+    extraFiles.add(abs);
+    return;
+  }
+  await addFileEntrypoint(abs, label);
+}
+
+/** Add every file below a directory as an nft entrypoint (`:trace` on a directory). */
+async function addDirEntrypoints(absDir, label) {
+  const entries = await fsp.readdir(absDir, { withFileTypes: true });
+  for (const entry of entries) {
+    await classifyAbsPath(path.join(absDir, entry.name), `${label}/${entry.name}`, TRACE);
   }
 }
 
@@ -157,7 +200,7 @@ async function addFileEntrypoint(abs, label) {
 }
 
 /** Classify an already-resolved absolute path: directory, symlink, or regular file. */
-async function classifyAbsPath(abs, label) {
+async function classifyAbsPath(abs, label, mode = null) {
   const st = await fsp.lstat(abs).catch(() => null);
 
   if (!st) {
@@ -166,7 +209,8 @@ async function classifyAbsPath(abs, label) {
   }
 
   if (st.isDirectory()) {
-    dirs.add(abs);
+    if (mode === TRACE) await addDirEntrypoints(abs, label);
+    else dirs.add(abs);
     return;
   }
 
@@ -179,14 +223,15 @@ async function classifyAbsPath(abs, label) {
     extraFiles.add(abs); // always copy the symlink itself
     const rst = await fsp.stat(real);
     if (rst.isDirectory()) {
-      dirs.add(real);
+      if (mode === TRACE) await addDirEntrypoints(real, label);
+      else dirs.add(real);
     } else {
-      await addFileEntrypoint(real, label);
+      await addFile(real, label, mode);
     }
     return;
   }
 
-  await addFileEntrypoint(abs, label);
+  await addFile(abs, label, mode);
 }
 
 const PKG_PREFIX = 'pkg:';
@@ -268,28 +313,31 @@ async function resolvePkgDir(pkgName) {
   return null;
 }
 
-async function classifyInput(input) {
+async function classifyInput(rawInput) {
+  const { spec: input, mode } = parseModeSuffix(rawInput);
+
   if (input.startsWith(PKG_PREFIX)) {
     const { pkgName, subpath } = parsePkgSpecifier(input.slice(PKG_PREFIX.length));
     const pkgDir = await resolvePkgDir(pkgName);
     if (!pkgDir) return; // missing() already reported (or warned, with --ignore-missing)
 
     if (!subpath) {
-      dirs.add(pkgDir);
+      if (mode === TRACE) await addDirEntrypoints(pkgDir, rawInput);
+      else dirs.add(pkgDir);
     } else if (hasGlobMagic(subpath)) {
-      globs.push(path.join(path.relative(root, pkgDir), subpath));
+      globs.push({ pattern: path.join(path.relative(root, pkgDir), subpath), mode });
     } else {
-      await classifyAbsPath(path.join(pkgDir, subpath), input);
+      await classifyAbsPath(path.join(pkgDir, subpath), rawInput, mode);
     }
     return;
   }
 
   if (hasGlobMagic(input)) {
-    globs.push(input);
+    globs.push({ pattern: input, mode });
     return;
   }
 
-  await classifyAbsPath(path.resolve(root, input), input);
+  await classifyAbsPath(path.resolve(root, input), rawInput, mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +406,31 @@ for (const input of inputs) {
   await classifyInput(input);
 }
 
+// Expand globs before tracing: `:trace` matches still have to become entrypoints.
+const verbatimGlobMatches = new Set(); // paths relative to root
+let globMatches = 0;
+if (globs.length > 0) {
+  const matches = new Map(); // rel -> mode ('trace' wins if a path matches both)
+  for (const { pattern, mode } of globs) {
+    let matched = false;
+    for await (const rel of fsp.glob(pattern, { cwd: root })) {
+      if (mode === TRACE || !matches.has(rel)) matches.set(rel, mode);
+      matched = true;
+    }
+    if (!matched) {
+      missing(`glob matched nothing: ${pattern}`);
+    }
+  }
+  globMatches = matches.size;
+  for (const rel of [...matches.keys()].sort()) {
+    if (matches.get(rel) === TRACE) {
+      await classifyAbsPath(path.join(root, rel), rel, TRACE);
+    } else {
+      verbatimGlobMatches.add(rel);
+    }
+  }
+}
+
 let traced = 0;
 if (entrypoints.size > 0) {
   const { fileList, warnings } = await nodeFileTrace([...entrypoints], {
@@ -376,28 +449,13 @@ if (entrypoints.size > 0) {
 
 for (const f of extraFiles) await copyEntry(f);
 
-let globMatches = 0;
-if (globs.length > 0) {
-  const matches = new Set();
-  for (const pattern of globs) {
-    let matched = false;
-    for await (const rel of fsp.glob(pattern, { cwd: root })) {
-      matches.add(rel);
-      matched = true;
-    }
-    if (!matched) {
-      missing(`glob matched nothing: ${pattern}`);
-    }
-  }
-  globMatches = matches.size;
-  for (const rel of [...matches].sort()) {
-    const abs = path.join(root, rel);
-    const st = await fsp.lstat(abs);
-    if (st.isDirectory()) {
-      await copyDirRecursive(abs);
-    } else {
-      await copyEntry(abs);
-    }
+for (const rel of verbatimGlobMatches) {
+  const abs = path.join(root, rel);
+  const st = await fsp.lstat(abs);
+  if (st.isDirectory()) {
+    await copyDirRecursive(abs);
+  } else {
+    await copyEntry(abs);
   }
 }
 
