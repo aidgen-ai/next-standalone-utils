@@ -8,9 +8,11 @@
  * Usage:
  *   copy-pnpm-symlinks [src_node_modules] [dst_node_modules]
  *
- * For every symlink directly under <src_node_modules> (including one level
- * into scoped @scope directories), if the link's target also exists relative
- * to <dst_node_modules>, the same symlink is (re)created there.
+ * Every node_modules directory is processed: the root one, plus the
+ * per-package ones inside .pnpm (and any nested node_modules below those).
+ * For every symlink directly under such a directory (including one level into
+ * scoped @scope directories), if the link's target also exists relative to the
+ * destination, the same symlink is (re)created there.
  *
  * Defaults:
  *   - No args: src=node_modules, dst=.next/standalone/node_modules
@@ -45,29 +47,82 @@ if (!fs.existsSync(dst)) {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Helpers
 // ---------------------------------------------------------------------------
 
-for (const name of fs.readdirSync(src)) {
-  if (name === '.pnpm') continue;
+function isDirectory(p) {
+  return fs.statSync(p, { throwIfNoEntry: false })?.isDirectory() ?? false;
+}
 
-  const srcPath = path.join(src, name);
-  const isScope = name.startsWith('@') && fs.lstatSync(srcPath).isDirectory();
+/**
+ * Collect the node_modules directories to wire up, as paths relative to the
+ * roots. The destination supplies the folder structure — only packages that
+ * were actually copied are worth linking — while the source decides which of
+ * those folders own a node_modules: a copied package may hold nothing but
+ * traced files, so the destination need not have that directory yet.
+ *
+ * Only real directories are walked; symlinks are never followed, so pnpm's
+ * link layout can't send us in circles.
+ */
+function findNodeModuleDirs(srcRoot, dstRoot) {
+  const found = [];
+  const stack = [''];
 
-  const items = isScope ? fs.readdirSync(srcPath).map((sub) => path.join(name, sub)) : [name];
+  while (stack.length > 0) {
+    const rel = stack.pop();
 
-  for (const item of items) {
-    const itemPath = path.join(src, item);
+    let entries;
+    try {
+      entries = fs.readdirSync(path.join(dstRoot, rel), { withFileTypes: true });
+    } catch {
+      continue;
+    }
 
-    if (fs.lstatSync(itemPath).isSymbolicLink()) {
-      const dstPath = path.join(dst, item);
-      const target = fs.readlinkSync(itemPath);
+    const nodeModules = path.join(rel, 'node_modules');
+    if (rel !== '' && isDirectory(path.join(srcRoot, nodeModules))) found.push(nodeModules);
 
-      if (fs.existsSync(path.resolve(path.dirname(dstPath), target))) {
-        fs.mkdirSync(path.dirname(dstPath), { recursive: true });
-        fs.rmSync(dstPath, { recursive: true, force: true });
-        fs.symlinkSync(target, dstPath);
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue; // Dirent.isDirectory() is false for symlinks
+      stack.push(path.join(rel, entry.name));
+    }
+  }
+
+  return found;
+}
+
+/** Re-create the symlinks of a single node_modules directory. */
+function linkNodeModules(srcDir, dstDir) {
+  for (const name of fs.readdirSync(srcDir)) {
+    if (name === '.pnpm') continue;
+
+    const srcPath = path.join(srcDir, name);
+    const isScope = name.startsWith('@') && fs.lstatSync(srcPath).isDirectory();
+
+    const items = isScope ? fs.readdirSync(srcPath).map((sub) => path.join(name, sub)) : [name];
+
+    for (const item of items) {
+      const itemPath = path.join(srcDir, item);
+
+      if (fs.lstatSync(itemPath).isSymbolicLink()) {
+        const dstPath = path.join(dstDir, item);
+        const target = fs.readlinkSync(itemPath);
+
+        if (fs.existsSync(path.resolve(path.dirname(dstPath), target))) {
+          fs.mkdirSync(path.dirname(dstPath), { recursive: true });
+          fs.rmSync(dstPath, { recursive: true, force: true });
+          fs.symlinkSync(target, dstPath);
+        }
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+// '' is the root node_modules pair itself; missing destination directories are
+// created on demand, as each link is written.
+for (const rel of ['', ...findNodeModuleDirs(src, dst)]) {
+  linkNodeModules(path.join(src, rel), path.join(dst, rel));
 }
