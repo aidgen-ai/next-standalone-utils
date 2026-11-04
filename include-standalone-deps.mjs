@@ -23,7 +23,8 @@
  *     node_modules path then.
  *   - existing file (or symlink to one): resolved through .bin shims
  *     (pnpm cmd-shim or symlink) and traced with @vercel/nft; the shim or
- *     symlink itself is copied too
+ *     symlink itself is copied too. A shell script without a cmd-shim target
+ *     is copied as-is, without tracing
  *   - existing directory (or symlink to one): copied recursively, verbatim
  *   - contains glob characters (star, ?, [, {): treated as a glob relative
  *     to --root, matches are copied verbatim (a trailing "double-star" is
@@ -177,28 +178,27 @@ async function addDirEntrypoints(absDir, label) {
   }
 }
 
-// A shebang that runs a shell (`#!/bin/sh`, `#!/usr/bin/env bash`, ...): the file cannot be
-// traced itself, only the JS file it runs.
+// A shebang that runs a shell (`#!/bin/sh`, `#!/usr/bin/env bash`, ...): nothing to trace in the file itself.
 const SHELL_SHEBANG = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?(?:sh|bash|dash|zsh)(?:\s|$)/;
 
-/** Resolve a regular file: .bin shim -> its JS target, otherwise the file itself. */
+/**
+ * Resolve a regular file: .bin shim -> its JS target, a shell script -> copied as-is, otherwise the file itself
+ * (also with a shebang that is not node, e.g. the `env -S npx tsx` that tsc keeps in a compiled script).
+ */
 async function addFileEntrypoint(abs, label) {
   const content = await fsp.readFile(abs, 'utf8');
   const firstLine = content.split('\n', 1)[0];
-  // Any other shebang (`node`, but also e.g. `env -S npx tsx` kept by tsc in a compiled
-  // script) still marks a JS file, unless it names a cmd-shim target.
   const target = content.startsWith('#!') && !/^#!.*\bnode\b/.test(firstLine) ? parseCmdShim(abs, content) : null;
-  if (target || SHELL_SHEBANG.test(firstLine)) {
-    // Shell shim (pnpm cmd-shim): find the real JS entry
-    if (!target) {
-      console.error(`Could not determine cmd-shim target of ${label}`);
-      process.exit(1);
-    }
+  if (target) {
+    // Shell shim (pnpm cmd-shim): trace the real JS entry
     if (!fs.existsSync(target)) {
       console.error(`cmd-shim target of ${label} does not exist: ${target}`);
       process.exit(1);
     }
     entrypoints.add(target);
+    extraFiles.add(abs);
+  } else if (SHELL_SHEBANG.test(firstLine)) {
+    // A shell script that runs no JS of its own
     extraFiles.add(abs);
   } else {
     // Plain JS file (possibly with a node shebang)
