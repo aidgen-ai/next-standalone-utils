@@ -177,12 +177,19 @@ async function addDirEntrypoints(absDir, label) {
   }
 }
 
+// A shebang that runs a shell (`#!/bin/sh`, `#!/usr/bin/env bash`, ...): the file cannot be
+// traced itself, only the JS file it runs.
+const SHELL_SHEBANG = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?(?:sh|bash|dash|zsh)(?:\s|$)/;
+
 /** Resolve a regular file: .bin shim -> its JS target, otherwise the file itself. */
 async function addFileEntrypoint(abs, label) {
   const content = await fsp.readFile(abs, 'utf8');
-  if (content.startsWith('#!') && !/^#!.*\bnode\b/.test(content.split('\n', 1)[0])) {
+  const firstLine = content.split('\n', 1)[0];
+  // Any other shebang (`node`, but also e.g. `env -S npx tsx` kept by tsc in a compiled
+  // script) still marks a JS file, unless it names a cmd-shim target.
+  const target = content.startsWith('#!') && !/^#!.*\bnode\b/.test(firstLine) ? parseCmdShim(abs, content) : null;
+  if (target || SHELL_SHEBANG.test(firstLine)) {
     // Shell shim (pnpm cmd-shim): find the real JS entry
-    const target = parseCmdShim(abs, content);
     if (!target) {
       console.error(`Could not determine cmd-shim target of ${label}`);
       process.exit(1);
