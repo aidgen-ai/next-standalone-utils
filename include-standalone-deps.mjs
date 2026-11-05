@@ -55,6 +55,10 @@
  *   --all              Also copy files outside node_modules (default: skip them)
  *   --ignore-missing   Warn instead of failing on missing paths / empty globs
  *   --verbose          Log every copied file
+ *   --conditions <c>   Also resolve package exports under these conditions
+ *                      (comma-separated, repeatable), like node's --conditions:
+ *                      trace with the ones the traced files are run with,
+ *                      e.g. react-server for `node --conditions=react-server`
  *
  * Files are written to <out>/<path relative to root>. Existing files are never
  * overwritten (Next.js may have written them first). Symlinks are recreated as
@@ -79,6 +83,7 @@ let root = process.cwd();
 let copyAll = false;
 let verbose = false;
 let ignoreMissing = false;
+const conditions = ['node'];
 
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
@@ -87,9 +92,10 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '--all') copyAll = true;
   else if (a === '--verbose') verbose = true;
   else if (a === '--ignore-missing') ignoreMissing = true;
+  else if (a === '--conditions') conditions.push(...args[++i].split(',').filter(Boolean));
   else if (a === '--help' || a === '-h') {
     console.log(
-      'Usage: include-standalone-deps [--out dir] [--root dir] [--all] [--ignore-missing] [--verbose] <path-or-glob>[:trace|:notrace]...',
+      'Usage: include-standalone-deps [--out dir] [--root dir] [--all] [--ignore-missing] [--verbose] [--conditions c1,c2] <path-or-glob>[:trace|:notrace]...',
     );
     process.exit(0);
   } else if (a.startsWith('--')) {
@@ -444,6 +450,7 @@ if (entrypoints.size > 0) {
     base: root,
     processCwd: root,
     mixedModules: true,
+    conditions,
   });
   traced = fileList.size;
   if (verbose) {
